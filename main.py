@@ -149,7 +149,7 @@ def checkin(data: CheckinRequest, user_info: dict = Depends(get_current_user)):
     # Validar GPS — debe estar dentro de 100 metros de la oficina
     OFFICE_LAT = 9.999953
     OFFICE_LNG = -84.1213769
-    MAX_DISTANCE_M = 100
+    MAX_DISTANCE_M = 500
 
     if data.latitude is not None and data.longitude is not None:
         from math import radians, sin, cos, sqrt, atan2
