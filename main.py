@@ -142,13 +142,17 @@ def checkin(data: CheckinRequest, user_info: dict = Depends(get_current_user)):
         conn.close()
         raise HTTPException(status_code=404, detail="Tag no registrado en el sistema")
 
+    # Detectar automáticamente si es entrada o salida según el nombre del tag
+    location = tag["location_name"].lower()
+    event_type = "out" if "salida" in location else "in"
+
     # 3. Rate limit: no permitir mismo evento dos veces en 5 minutos
     user_id = int(user_info["sub"])
     cur.execute("""
         SELECT * FROM records
         WHERE user_id = %s AND event_type = %s
         AND timestamp > NOW() - INTERVAL '5 minutes'
-    """, (user_id, data.event_type))
+    """, (user_id, event_type))
     if cur.fetchone():
         cur.close()
         conn.close()
@@ -171,13 +175,13 @@ def checkin(data: CheckinRequest, user_info: dict = Depends(get_current_user)):
     cur.execute("""
         INSERT INTO records (user_id, full_name, device_id, tag_uid, event_type, timestamp, latitude, longitude)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-    """, (user_id, full_name, data.device_id, data.tag_uid, data.event_type, now, data.latitude, data.longitude))
+    """, (user_id, full_name, data.device_id, data.tag_uid, event_type, now, data.latitude, data.longitude))
     conn.commit()
     cur.close()
     conn.close()
 
     return {
-        "message": f"Check-{'in' if data.event_type == 'in' else 'out'} registrado correctamente",
+        "message": f"Check-{'in' if event_type == 'in' else 'out'} registrado correctamente",
         "timestamp": now.isoformat(),
         "location": tag["location_name"]
     }
