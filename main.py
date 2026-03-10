@@ -146,6 +146,29 @@ def checkin(data: CheckinRequest, user_info: dict = Depends(get_current_user)):
     location = tag["location_name"].lower()
     event_type = "out" if "salida" in location else "in"
 
+    # Validar GPS — debe estar dentro de 100 metros de la oficina
+    OFFICE_LAT = 9.999953
+    OFFICE_LNG = -84.1213769
+    MAX_DISTANCE_M = 100
+
+    if data.latitude is not None and data.longitude is not None:
+        from math import radians, sin, cos, sqrt, atan2
+        R = 6371000
+        lat1, lon1 = radians(OFFICE_LAT), radians(OFFICE_LNG)
+        lat2, lon2 = radians(data.latitude), radians(data.longitude)
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+        distance = R * 2 * atan2(sqrt(a), sqrt(1-a))
+        if distance > MAX_DISTANCE_M:
+            cur.close()
+            conn.close()
+            raise HTTPException(status_code=403, detail=f"Debes estar en la oficina para registrar asistencia (distancia: {int(distance)}m)")
+    else:
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=403, detail="Se requiere ubicacion GPS para registrar asistencia")
+
     # 3. Rate limit: no permitir mismo evento dos veces en 5 minutos
     user_id = int(user_info["sub"])
     cur.execute("""
