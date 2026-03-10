@@ -163,7 +163,7 @@ def checkin(data: CheckinRequest, user_info: dict = Depends(get_current_user)):
         if distance > MAX_DISTANCE_M:
             cur.close()
             conn.close()
-            raise HTTPException(status_code=403, detail=f"Debes estar en la oficina para registrar asistencia (distancia: {int(distance)}m)")
+            raise HTTPException(status_code=403, detail=f"Debes estar en la oficina para registrar asistencia")
     else:
         cur.close()
         conn.close()
