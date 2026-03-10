@@ -1,0 +1,29 @@
+name: Reporte Semanal de Asistencia
+
+on:
+  schedule:
+    # Corre todos los lunes a las 7:00 AM hora Costa Rica (13:00 UTC)
+    - cron: '0 13 * * 1'
+  workflow_dispatch: # Permite correrlo manualmente desde GitHub
+
+jobs:
+  enviar-reporte:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v3
+
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias
+        run: pip install psycopg2-binary requests
+
+      - name: Enviar reporte semanal
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+        run: python reporte_semanal.py
