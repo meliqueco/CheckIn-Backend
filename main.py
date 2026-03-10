@@ -1,15 +1,16 @@
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from typing import Optional
-import sqlite3
 import hashlib
 import hmac
 import secrets
 import jwt
 import datetime
 import os
+import psycopg2
+import psycopg2.extras
 
 app = FastAPI(title="NFC Check-in System")
 
@@ -26,56 +27,14 @@ SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = 12
 NFC_HMAC_SECRET = os.getenv("NFC_HMAC_SECRET", secrets.token_hex(32))
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# --- DB Setup ---
-DB_PATH = "checkin.db"
-
+# --- DB ---
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(DATABASE_URL)
     return conn
 
-def init_db():
-    conn = get_db()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            full_name TEXT,
-            is_admin INTEGER DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS nfc_tags (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            uid TEXT UNIQUE NOT NULL,
-            location_name TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            tag_uid TEXT NOT NULL,
-            event_type TEXT NOT NULL CHECK(event_type IN ('in', 'out')),
-            timestamp TEXT NOT NULL,
-            latitude REAL,
-            longitude REAL,
-            ip_address TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        );
-    """)
-    pw_hash = hash_password("admin123")
-    try:
-        conn.execute(
-            "INSERT INTO users (username, password_hash, full_name, is_admin) VALUES (?, ?, ?, 1)",
-            ("admin", pw_hash, "Administrador")
-        )
-        conn.commit()
-    except:
-        pass
-    conn.close()
-
+# --- Auth helpers ---
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
@@ -128,6 +87,7 @@ class CheckinRequest(BaseModel):
     event_type: str
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    device_id: Optional[str] = None
 
 class CreateTag(BaseModel):
     uid: str
@@ -138,9 +98,10 @@ class CreateTag(BaseModel):
 @app.post("/auth/login")
 def login(form: OAuth2PasswordRequestForm = Depends()):
     conn = get_db()
-    user = conn.execute(
-        "SELECT * FROM users WHERE username = ?", (form.username,)
-    ).fetchone()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM users WHERE username = %s", (form.username,))
+    user = cur.fetchone()
+    cur.close()
     conn.close()
     if not user or not verify_password(form.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Credenciales incorrectas")
@@ -150,73 +111,104 @@ def login(form: OAuth2PasswordRequestForm = Depends()):
 @app.post("/auth/register")
 def register(data: RegisterUser, admin=Depends(require_admin)):
     conn = get_db()
+    cur = conn.cursor()
     try:
-        conn.execute(
-            "INSERT INTO users (username, password_hash, full_name) VALUES (?, ?, ?)",
+        cur.execute(
+            "INSERT INTO users (username, password_hash, full_name) VALUES (%s, %s, %s)",
             (data.username, hash_password(data.password), data.full_name)
         )
         conn.commit()
         return {"message": "Usuario creado exitosamente"}
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         raise HTTPException(status_code=400, detail="El usuario ya existe")
     finally:
+        cur.close()
         conn.close()
 
 @app.post("/checkin")
-def checkin(data: CheckinRequest, request_info: dict = Depends(get_current_user)):
+def checkin(data: CheckinRequest, user_info: dict = Depends(get_current_user)):
+    # 1. Verificar firma del tag
     if not verify_tag_signature(data.tag_uid, data.tag_sig):
         raise HTTPException(status_code=403, detail="Tag NFC no válido o manipulado")
 
     conn = get_db()
-    tag = conn.execute("SELECT * FROM nfc_tags WHERE uid = ?", (data.tag_uid,)).fetchone()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    # 2. Verificar que el tag existe
+    cur.execute("SELECT * FROM nfc_tags WHERE uid = %s", (data.tag_uid,))
+    tag = cur.fetchone()
     if not tag:
+        cur.close()
         conn.close()
         raise HTTPException(status_code=404, detail="Tag no registrado en el sistema")
 
-    user_id = int(request_info["sub"])
-    recent = conn.execute("""
+    # 3. Rate limit: no permitir mismo evento dos veces en 5 minutos
+    user_id = int(user_info["sub"])
+    cur.execute("""
         SELECT * FROM records
-        WHERE user_id = ? AND event_type = ?
-        AND timestamp > datetime('now', '-5 minutes')
-    """, (user_id, data.event_type)).fetchone()
-    if recent:
+        WHERE user_id = %s AND event_type = %s
+        AND timestamp > NOW() - INTERVAL '5 minutes'
+    """, (user_id, data.event_type))
+    if cur.fetchone():
+        cur.close()
         conn.close()
         raise HTTPException(status_code=429, detail="Ya registraste este evento recientemente")
 
-    now = datetime.datetime.utcnow().isoformat()
-    conn.execute("""
-        INSERT INTO records (user_id, tag_uid, event_type, timestamp, latitude, longitude)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (user_id, data.tag_uid, data.event_type, now, data.latitude, data.longitude))
+    # 4. Obtener nombre del usuario
+    cur.execute("SELECT full_name FROM users WHERE id = %s", (user_id,))
+    user_row = cur.fetchone()
+    full_name = user_row["full_name"] if user_row else "—"
+
+    # 5. Actualizar device_id en el usuario si viene uno nuevo
+    if data.device_id:
+        cur.execute(
+            "UPDATE users SET device_id = %s WHERE id = %s",
+            (data.device_id, user_id)
+        )
+
+    # 6. Guardar registro
+    now = datetime.datetime.utcnow()
+    cur.execute("""
+        INSERT INTO records (user_id, full_name, device_id, tag_uid, event_type, timestamp, latitude, longitude)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    """, (user_id, full_name, data.device_id, data.tag_uid, data.event_type, now, data.latitude, data.longitude))
     conn.commit()
+    cur.close()
     conn.close()
 
     return {
         "message": f"Check-{'in' if data.event_type == 'in' else 'out'} registrado correctamente",
-        "timestamp": now,
+        "timestamp": now.isoformat(),
         "location": tag["location_name"]
     }
 
 @app.get("/records/me")
 def my_records(user=Depends(get_current_user)):
     conn = get_db()
-    rows = conn.execute("""
-        SELECT r.*, u.full_name FROM records r
-        JOIN users u ON r.user_id = u.id
-        WHERE r.user_id = ?
-        ORDER BY r.timestamp DESC LIMIT 50
-    """, (int(user["sub"]),)).fetchall()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT * FROM records
+        WHERE user_id = %s
+        ORDER BY timestamp DESC LIMIT 50
+    """, (int(user["sub"]),))
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
     return [dict(r) for r in rows]
 
 @app.get("/records/all")
 def all_records(admin=Depends(require_admin)):
     conn = get_db()
-    rows = conn.execute("""
-        SELECT r.*, u.full_name, u.username FROM records r
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT r.*, u.username, u.device_id as user_device_id
+        FROM records r
         JOIN users u ON r.user_id = u.id
-        ORDER BY r.timestamp DESC LIMIT 500
-    """).fetchall()
+        ORDER BY r.timestamp DESC
+        LIMIT 500
+    """)
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -224,32 +216,38 @@ def all_records(admin=Depends(require_admin)):
 def create_tag(data: CreateTag, admin=Depends(require_admin)):
     sig = sign_tag_uid(data.uid)
     conn = get_db()
+    cur = conn.cursor()
     try:
-        conn.execute("INSERT INTO nfc_tags (uid, location_name) VALUES (?, ?)", (data.uid, data.location_name))
+        cur.execute("INSERT INTO nfc_tags (uid, location_name) VALUES (%s, %s)", (data.uid, data.location_name))
         conn.commit()
-        nfc_url = f"https://TU-DOMINIO.com/?uid={data.uid}&sig={sig}"
+        nfc_url = f"https://jocular-pasca-d30f94.netlify.app/?uid={data.uid}&sig={sig}"
         return {"message": "Tag creado", "nfc_url": nfc_url, "uid": data.uid, "sig": sig}
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         raise HTTPException(status_code=400, detail="UID ya registrado")
     finally:
+        cur.close()
         conn.close()
 
 @app.get("/tags")
 def list_tags(admin=Depends(require_admin)):
     conn = get_db()
-    rows = conn.execute("SELECT * FROM nfc_tags").fetchall()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM nfc_tags")
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
     return [dict(r) for r in rows]
 
 @app.get("/users")
 def list_users(admin=Depends(require_admin)):
     conn = get_db()
-    rows = conn.execute("SELECT id, username, full_name, is_admin FROM users").fetchall()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT id, username, full_name, device_id, is_admin, created_at FROM users")
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
     return [dict(r) for r in rows]
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
-init_db()
