@@ -207,7 +207,7 @@ def send_email(html, week_start, week_end):
             "Content-Type": "application/json"
         },
         json={
-            "from": "onboarding@resend.dev>",
+            "from": "onboarding@resend.dev",
             "to": [REPORT_EMAIL],
             "subject": f"📋 Reporte de asistencia — Semana {semana_str}",
             "html": html
