@@ -7,7 +7,7 @@ from collections import defaultdict
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 RESEND_API_KEY = os.environ["RESEND_API_KEY"]
-REPORT_EMAIL = "meli_que@yahoo.com"
+REPORT_EMAIL = "meliqueco@gmail.com"
 HORA_ENTRADA = 8  # 8:00am
 
 def get_week_records():
